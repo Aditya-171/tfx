@@ -21,6 +21,7 @@ import tensorflow as tf
 from tfx import types
 from tfx.dsl.component.experimental.annotations import BeamComponentParameter
 from tfx.dsl.component.experimental.annotations import InputArtifact
+from tfx.dsl.component.experimental.annotations import IntermediateArtifact
 from tfx.dsl.component.experimental.annotations import OutputArtifact
 from tfx.dsl.component.experimental.annotations import OutputDict
 from tfx.dsl.component.experimental.annotations import Parameter
@@ -355,6 +356,13 @@ def _list_of_artifacts(
   assert isinstance(one_examples[0], standard_artifacts.Examples)
   assert len(two_examples) == 2
   assert all(isinstance(e, standard_artifacts.Examples) for e in two_examples)
+
+
+@component
+def _intermediate_artifact(
+    checkpoint_model: IntermediateArtifact[standard_artifacts.Model],  # pylint: disable=unused-argument
+):
+  pass
 
 
 class ComponentDecoratorTest(tf.test.TestCase):
@@ -746,6 +754,21 @@ class ComponentDecoratorTest(tf.test.TestCase):
         ],
     )
 
+    beam_dag_runner.BeamDagRunner().run(test_pipeline)
+
+  def testIntermediateArtifacts(self):
+    intermediate_artifact_instance = _intermediate_artifact()  # pylint: disable=no-value-for-parameter
+    metadata_config = metadata.sqlite_metadata_connection_config(
+        self._metadata_path
+    )
+    test_pipeline = pipeline.Pipeline(
+        pipeline_name='test_pipeline_1',
+        pipeline_root=self._test_dir,
+        metadata_connection_config=metadata_config,
+        components=[
+            intermediate_artifact_instance,
+        ],
+    )
     beam_dag_runner.BeamDagRunner().run(test_pipeline)
 
 
