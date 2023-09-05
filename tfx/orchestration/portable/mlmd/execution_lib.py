@@ -499,6 +499,9 @@ def register_pending_output_artifacts(
   PENDING_OUTPUT to associate them with the execution. The output artifacts will
   be modified in-place to add IDs as registered by MLMD.
 
+  However, Artifacts in output_artifacts with state REFERENCE will keep their
+  state and an OUTPUT event will associate them with the execution.
+
   This function is idempotent if called more than once with the same output
   artifact dict. In that case, the function will find the already registered
   output artifacts for the execution and reuse their IDs. This function cannot,
@@ -523,8 +526,17 @@ def register_pending_output_artifacts(
                      f'execution ID={execution_id} with state = '
                      f'{execution.last_known_state}')
 
-  for artifact in itertools.chain.from_iterable(output_artifacts.values()):
-    artifact.state = ArtifactState.PENDING
+  reference_output_artifacts = {}
+  pending_output_artifacts = {}
+  for key, artifacts in output_artifacts.items():
+    reference_output_artifacts[key] = []
+    pending_output_artifacts[key] = []
+    for artifact in artifacts:
+      if artifact.state == ArtifactState.REFERENCE:
+        reference_output_artifacts[key].append(artifact)
+      else:
+        artifact.state = ArtifactState.PENDING
+        pending_output_artifacts[key].append(artifact)
 
   existing_pending_output_artifacts = get_pending_output_artifacts(
       metadata_handle, execution_id)
@@ -549,13 +561,36 @@ def register_pending_output_artifacts(
   else:
     # Register the pending output artifacts for this execution.
     contexts = metadata_handle.store.get_contexts_by_execution(execution_id)
-    _ = put_execution(
-        metadata_handle,
-        execution,
-        contexts,
-        output_artifacts=output_artifacts,
-        output_event_type=metadata_store_pb2.Event.PENDING_OUTPUT
+    outputs_utils.tag_output_artifacts_with_version(output_artifacts)
+    artifact_and_events = _create_artifact_and_event_pairs(
+        metadata_handler=metadata_handle,
+        artifact_dict=pending_output_artifacts,
+        event_type=metadata_store_pb2.Event.PENDING_OUTPUT,
     )
+    artifact_and_events.extend(
+        _create_artifact_and_event_pairs(
+            metadata_handler=metadata_handle,
+            artifact_dict=reference_output_artifacts,
+            event_type=metadata_store_pb2.Event.OUTPUT,
+        )
+    )
+    execution_id, artifact_ids, context_ids = (
+        metadata_handle.store.put_execution(
+            execution=execution,
+            artifact_and_events=artifact_and_events,
+            contexts=contexts,
+            reuse_context_if_already_exist=True,
+            reuse_artifact_if_already_exist_by_external_id=True,
+        )
+    )
+    execution.id = execution_id
+    for artifact_and_event, artifact_id in zip(
+        artifact_and_events, artifact_ids
+    ):
+      artifact, _ = artifact_and_event
+      artifact.id = artifact_id
+    for context, context_id in zip(contexts, context_ids):
+      context.id = context_id
 
   telemetry_utils.noop_telemetry(
       module='execution_lib',

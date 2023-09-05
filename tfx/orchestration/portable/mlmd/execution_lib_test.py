@@ -29,6 +29,7 @@ from tfx.orchestration.portable.mlmd import context_lib
 from tfx.orchestration.portable.mlmd import execution_lib
 from tfx.proto.orchestration import execution_result_pb2
 from tfx.proto.orchestration import pipeline_pb2
+from tfx.types import artifact as artifact_type
 from tfx.types import artifact_utils
 from tfx.types import standard_artifacts
 from tfx.utils import test_case_utils
@@ -748,6 +749,79 @@ class ExecutionLibTest(test_case_utils.TfxTest, parameterized.TestCase):
       execution_lib.register_pending_output_artifacts(
           self._mlmd_handle, execution.id,
           {'model': [output_model_second_call]})
+
+  def testRegisterOutputArtifactsWithReferenceArtifacts(self):
+    input_example = _create_tfx_artifact(uri='example')
+    _ = _write_tfx_artifacts(self._mlmd_handle, [input_example])
+    execution = execution_lib.put_execution(
+        self._mlmd_handle,
+        execution_lib.prepare_execution(
+            self._mlmd_handle,
+            metadata_store_pb2.ExecutionType(name='my_execution_type'),
+            state=metadata_store_pb2.Execution.RUNNING,
+        ),
+        self._generate_contexts(self._mlmd_handle),
+        input_artifacts={'example': [input_example]},
+    )
+
+    checkpoint_model = _create_tfx_artifact(uri='model')
+    checkpoint_model.state = artifact_type.ArtifactState.REFERENCE
+    xid = _create_tfx_artifact(uri='xid')
+    output_artifacts = {'checkpoint_model': [checkpoint_model], 'xid': [xid]}
+    execution_lib.register_pending_output_artifacts(
+        self._mlmd_handle, execution.id, output_artifacts
+    )
+
+    # Check that the REFERENCE intermediate artifact still has state REFERENCE.
+    actual_checkpoint_model = self._mlmd_handle.store.get_artifacts_by_id(
+        [checkpoint_model.id]
+    )[0]
+    self.assertProtoPartiallyEquals(
+        checkpoint_model.mlmd_artifact,
+        actual_checkpoint_model,
+        ignored_fields=[
+            'type',
+            'create_time_since_epoch',
+            'last_update_time_since_epoch',
+        ],
+    )
+    self.assertEqual(
+        actual_checkpoint_model.state, metadata_store_pb2.Artifact.REFERENCE
+    )
+    self.assertEqual(
+        actual_checkpoint_model.type, _DEFAULT_ARTIFACT_TYPE.TYPE_NAME
+    )
+
+    actual_xid = self._mlmd_handle.store.get_artifacts_by_id([xid.id])[0]
+    self.assertProtoPartiallyEquals(
+        xid.mlmd_artifact,
+        actual_xid,
+        ignored_fields=[
+            'type',
+            'create_time_since_epoch',
+            'last_update_time_since_epoch',
+        ],
+    )
+    self.assertEqual(actual_xid.state, metadata_store_pb2.Artifact.PENDING)
+    self.assertEqual(actual_xid.type, _DEFAULT_ARTIFACT_TYPE.TYPE_NAME)
+
+    # Verify that an OUTPUT edge exists between the execution and the REFERENCE
+    # checkpoint_model artifact.
+    [output_event] = self._mlmd_handle.store.get_events_by_artifact_ids(
+        [checkpoint_model.id]
+    )
+    self.assertEqual(output_event.execution_id, execution.id)
+    self.assertEqual(output_event.type, metadata_store_pb2.Event.OUTPUT)
+    self.assertLen(output_event.path.steps, 2)
+
+    # Verify that an PENDING_OUTPUT edge exists between the execution and the
+    # PENDING xid artifact.
+    [output_event] = self._mlmd_handle.store.get_events_by_artifact_ids(
+        [xid.id]
+    )
+    self.assertEqual(output_event.execution_id, execution.id)
+    self.assertEqual(output_event.type, metadata_store_pb2.Event.PENDING_OUTPUT)
+    self.assertLen(output_event.path.steps, 2)
 
   @parameterized.named_parameters(
       dict(
