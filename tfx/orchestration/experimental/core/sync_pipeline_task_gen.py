@@ -26,7 +26,6 @@ from tfx.orchestration.experimental.core import task as task_lib
 from tfx.orchestration.experimental.core import task_gen
 from tfx.orchestration.experimental.core import task_gen_utils
 from tfx.orchestration import mlmd_connection_manager as mlmd_cm
-from tfx.orchestration.portable import outputs_utils
 from tfx.orchestration.portable.input_resolution import exceptions
 from tfx.orchestration.portable.mlmd import execution_lib
 from tfx.proto.orchestration import pipeline_pb2
@@ -457,43 +456,16 @@ class _Generator:
       for artifacts in input_and_params.input_artifacts.values():
         task_gen_utils.update_external_artifact_type(self._mlmd_handle,
                                                      artifacts)
-
-    executions = task_gen_utils.register_executions(
-        metadata_handler=self._mlmd_handle,
-        execution_type=node.node_info.type,
-        contexts=resolved_info.contexts,
-        input_and_params=resolved_info.input_and_params)
-
-    # Selects the first artifacts and create a exec task.
-    input_artifacts = resolved_info.input_and_params[0].input_artifacts
-    # Selects the first execution and marks it as RUNNING.
-    with mlmd_state.mlmd_execution_atomic_op(
-        mlmd_handle=self._mlmd_handle,
-        execution_id=executions[0].id) as execution:
-      execution.last_known_state = metadata_store_pb2.Execution.RUNNING
-    outputs_resolver = outputs_utils.OutputsResolver(
-        node, self._pipeline.pipeline_info, self._pipeline.runtime_spec,
-        self._pipeline.execution_mode)
-    output_artifacts = outputs_resolver.generate_output_artifacts(execution.id)
-    outputs_utils.make_output_dirs(output_artifacts)
-
-    result.append(
-        task_lib.UpdateNodeStateTask(
-            node_uid=node_uid, state=pstate.NodeState.RUNNING))
-    result.append(
-        task_lib.ExecNodeTask(
-            node_uid=node_uid,
-            execution_id=execution.id,
+    result.extend(
+        task_gen_utils.register_executions_and_generate_tasks_from_inputs(
+            metadata_handler=self._mlmd_handle,
+            node=node,
+            input_and_params=resolved_info.input_and_params,
             contexts=resolved_info.contexts,
-            input_artifacts=input_artifacts,
-            exec_properties=resolved_info.input_and_params[0].exec_properties,
-            output_artifacts=output_artifacts,
-            executor_output_uri=outputs_resolver.get_executor_output_uri(
-                execution.id),
-            stateful_working_dir=outputs_resolver
-            .get_stateful_working_directory(execution.id),
-            tmp_dir=outputs_resolver.make_tmp_dir(execution.id),
-            pipeline=self._pipeline))
+            pipeline=self._pipeline,
+            execution_node_state=pstate.NodeState.RUNNING,
+        )
+    )
     return result
 
   def _ensure_node_services_if_pure(

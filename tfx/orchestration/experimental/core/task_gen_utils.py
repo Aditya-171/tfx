@@ -16,7 +16,7 @@
 import collections
 import itertools
 import textwrap
-from typing import Dict, Iterable, List, MutableMapping, Optional, Sequence, Tuple, Type
+from typing import Callable, Dict, Iterable, List, MutableMapping, Optional, Sequence, Tuple, Type
 import uuid
 
 from absl import logging
@@ -27,6 +27,7 @@ from tfx.orchestration import data_types_utils
 from tfx.orchestration import metadata
 from tfx.orchestration import node_proto_view
 from tfx.orchestration.experimental.core import constants
+from tfx.orchestration.experimental.core import mlmd_state
 from tfx.orchestration.experimental.core import task as task_lib
 from tfx.orchestration import mlmd_connection_manager as mlmd_cm
 from tfx.orchestration.portable import inputs_utils
@@ -173,15 +174,14 @@ def resolve_exec_properties(
 
 
 def generate_resolved_info(
-    mlmd_connection_manager: mlmd_cm.MLMDConnectionManager,
+    mlmd_handle_like: mlmd_cm.HandleLike,
     node: node_proto_view.NodeProtoView,
     skip_errors: Iterable[Type[exceptions.InputResolutionError]] = (),
 ) -> ResolvedInfo:
   """Returns a `ResolvedInfo` object for executing the node or `None` to skip.
 
   Args:
-    mlmd_connection_manager: MLMDConnectionManager instance for handling
-      multiple mlmd db connections.
+    mlmd_handle_like: An instance for handling multiple mlmd db connections.
     node: The pipeline node for which to generate.
     skip_errors: A list of errors to skip on the given error types.
 
@@ -194,8 +194,9 @@ def generate_resolved_info(
   """
   # Register node contexts.
   contexts = context_lib.prepare_contexts(
-      metadata_handler=mlmd_connection_manager.primary_mlmd_handle,
-      node_contexts=node.contexts)
+      metadata_handler=mlmd_cm.get_handle(mlmd_handle_like),
+      node_contexts=node.contexts,
+  )
 
   result = ResolvedInfo(
       contexts=contexts,
@@ -208,7 +209,7 @@ def generate_resolved_info(
   # Resolve inputs.
   try:
     resolved_input_artifacts = inputs_utils.resolve_input_artifacts(
-        metadata_handler=mlmd_connection_manager, pipeline_node=node
+        metadata_handler=mlmd_handle_like, pipeline_node=node
     )
   except exceptions.InputResolutionError as e:
     for skip_error in skip_errors:
@@ -519,7 +520,7 @@ def register_executions(
     metadata_handler: metadata.Metadata,
     execution_type: metadata_store_pb2.ExecutionType,
     contexts: Sequence[metadata_store_pb2.Context],
-    input_and_params: List[InputAndParam],
+    input_and_params: Sequence[InputAndParam],
 ) -> Sequence[metadata_store_pb2.Execution]:
   """Registers multiple executions in MLMD.
 
@@ -779,3 +780,100 @@ def interpret_status_from_failed_execution(
     )
   error_msg = textwrap.shorten(error_msg, width=512) if error_msg else None
   return status_lib.Status(code=error_code, message=error_msg)
+
+
+def register_executions_and_generate_tasks_from_inputs(
+    metadata_handler: metadata.Metadata,
+    node: node_proto_view.NodeProtoView,
+    input_and_params: Sequence[InputAndParam],
+    contexts: Sequence[metadata_store_pb2.Context],
+    pipeline: pipeline_pb2.Pipeline,
+    execution_node_state: str,
+    backfill_token: str = '',
+    register_execution_watcher_fn: Optional[
+        Callable[[metadata_store_pb2.Execution], None]
+    ] = None,
+    execution_commit_fn: Optional[
+        Callable[
+            [
+                Optional[metadata_store_pb2.Execution],
+                metadata_store_pb2.Execution,
+            ],
+            None,
+        ]
+    ] = None,
+) -> Sequence[task_lib.Task]:
+  """Registers executions and generates tasks for node.
+
+  Args:
+    metadata_handler: Handler to interact with MLMD.
+    node: Node to generate executions/tasks for.
+    input_and_params: Inputs and params for node execution.
+    contexts: Contexts for node execution.
+    pipeline: Pipeline for this execution.
+    execution_node_state: What state the execution should be set to. Should
+      always be pstate.NodeState.RUNNING but we can't import pstate here due to
+      circular dependencies.
+    backfill_token: The backfill token for the execution, if applicable.
+    register_execution_watcher_fn: Optional function to be called on all newly
+      registered executions.
+    execution_commit_fn: Optional function to be provided when the new execution
+      is updated.
+
+  Returns:
+    A list of tasks for the node. Guaranteed to be in the form of:
+    [UpdateNodeStateTask, ExecNodeTask].
+  """
+  executions = register_executions(
+      metadata_handler=metadata_handler,
+      execution_type=node.node_info.type,
+      contexts=contexts,
+      input_and_params=input_and_params,
+  )
+  if register_execution_watcher_fn:
+    map(register_execution_watcher_fn, executions)
+
+  execution = executions[0]
+
+  with mlmd_state.mlmd_execution_atomic_op(
+      metadata_handler, execution.id, on_commit=execution_commit_fn
+  ) as execution:
+    execution.last_known_state = metadata_store_pb2.Execution.RUNNING
+  outputs_resolver = outputs_utils.OutputsResolver(
+      node,
+      pipeline.pipeline_info,
+      pipeline.runtime_spec,
+      pipeline.execution_mode,
+  )
+  output_artifacts = outputs_resolver.generate_output_artifacts(execution.id)
+  outputs_utils.make_output_dirs(output_artifacts)
+
+  node_uid = task_lib.NodeUid.from_node(pipeline, node)
+  input_and_param = input_and_params[0]
+  tasks = []
+  tasks.append(
+      task_lib.UpdateNodeStateTask(
+          node_uid=node_uid,
+          state=execution_node_state,
+          backfill_token=backfill_token,
+      )
+  )
+  tasks.append(
+      task_lib.ExecNodeTask(
+          node_uid=node_uid,
+          execution_id=execution.id,
+          contexts=contexts,
+          input_artifacts=input_and_param.input_artifacts,
+          exec_properties=input_and_param.exec_properties,
+          output_artifacts=output_artifacts,
+          executor_output_uri=outputs_resolver.get_executor_output_uri(
+              execution.id
+          ),
+          stateful_working_dir=outputs_resolver.get_stateful_working_directory(
+              execution.id
+          ),
+          tmp_dir=outputs_resolver.make_tmp_dir(execution.id),
+          pipeline=pipeline,
+      )
+  )
+  return tasks
