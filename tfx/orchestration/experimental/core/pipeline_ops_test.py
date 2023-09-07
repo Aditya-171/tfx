@@ -52,6 +52,7 @@ from tfx.orchestration.portable.mlmd import execution_lib
 from tfx.proto.orchestration import pipeline_pb2
 from tfx.types import standard_artifacts
 from tfx.utils import status as status_lib
+from tfx.utils import test_case_utils
 
 from ml_metadata.proto import metadata_store_pb2
 
@@ -73,7 +74,9 @@ def _test_pipeline(
   return pipeline
 
 
-class PipelineOpsTest(test_utils.TfxTest, parameterized.TestCase):
+class PipelineOpsTest(
+    test_utils.TfxTest, parameterized.TestCase, test_case_utils.MlmdMixins
+):
 
   def setUp(self):
     super().setUp()
@@ -2801,6 +2804,46 @@ class PipelineOpsTest(test_utils.TfxTest, parameterized.TestCase):
         self.assertTrue(
             pipeline_state.execution.custom_properties.get('deleted')
         )
+
+  def test_mark_as_processed(self):
+    # We use MlmdMixins MLMD connection for convenience.
+    self.init_mlmd()
+
+    pipeline_context = self.put_context('pipeline', 'my-pipeline')
+    execution = self.put_execution(
+        execution_type='Trainer',
+        last_known_state=metadata_store_pb2.Execution.State.RUNNING,
+        contexts=[pipeline_context],
+    )
+    intermediately_read_artifacts = [
+        self.put_artifact(artifact_type='Model') for _ in range(10)
+    ]
+
+    # Read and mark the 10 Models as processsed.
+    pipeline_ops.mark_as_processed(
+        self.mlmd_handle, execution.id, intermediately_read_artifacts
+    )
+
+    # Check that all the events have the correct key and index of 0.
+    events = self.store.get_events_by_execution_ids([execution.id])
+    self.assertLen(events, 10)
+    for i, event in enumerate(events):
+      self.assertEqual(event.type, metadata_store_pb2.Event.INPUT)
+      self.assertEqual(event.path.steps[0].key, 'intermediate_read_artifact')
+      self.assertEqual(event.path.steps[1].index, i)
+
+    # Re-read the last 5 Models.
+    pipeline_ops.mark_as_processed(
+        self.mlmd_handle, execution.id, intermediately_read_artifacts[5:]
+    )
+
+    # The INPUT events should be unchanged.
+    events = self.store.get_events_by_execution_ids([execution.id])
+    self.assertLen(events, 10)
+    for i, event in enumerate(events):
+      self.assertEqual(event.type, metadata_store_pb2.Event.INPUT)
+      self.assertEqual(event.path.steps[0].key, 'intermediate_read_artifact')
+      self.assertEqual(event.path.steps[1].index, i)
 
 
 if __name__ == '__main__':

@@ -1887,7 +1887,7 @@ def publish_intermediate_artifact(
     event = event_lib.generate_event(
         event_type=metadata_store_pb2.Event.OUTPUT,
         key=output_key,
-        # Event index begins at 0, but we still to increment by 1 because the
+        # Event index begins at 0, but we still increment by 1 because the
         # REFERENCE artifact will have index 0.
         index=len(mlmd_protos.intermediate_artifacts) + 1,
     )
@@ -1905,3 +1905,63 @@ def publish_intermediate_artifact(
 
   logging.info('Published intermediate artifact: %s', intermediate_artifact)
   return intermediate_artifact
+
+
+@_pipeline_op()
+def mark_as_processed(
+    mlmd_handle: metadata.Metadata,
+    execution_id: int,
+    artifacts: list[metadata_store_pb2.Artifact],
+) -> None:
+  """Links the artifacts to the execution with INPUT events.
+
+  Args:
+    mlmd_handle: A handle to the MLMD database.
+    execution_id: The ID of the execution.
+    artifacts: The artifacts to link to the execution with INPUT events.
+  """
+  executions = mlmd_handle.store.get_executions_by_id([execution_id])
+  if len(executions) != 1:
+    raise status_lib.StatusNotOkError(
+        code=status_lib.Code.INVALID_ARGUMENT,
+        message=(
+            f'Expected exactly 1 Execution with id {execution_id}, but found '
+            f'{len(executions)}: {executions}'
+        ),
+    )
+  execution = executions[0]
+  contexts = mlmd_handle.store.get_contexts_by_execution(execution.id)
+
+  # Find existing INPUT events associated with the passed in artifacts.
+  artifact_ids = set(a.id for a in artifacts)
+  artifact_ids_in_existing_events = set()
+  num_existing_events = 0
+  for event in mlmd_handle.store.get_events_by_execution_ids([execution.id]):
+    if event_lib.is_valid_input_event(
+        event, expected_input_key=constants.INTERMEDIATE_READ_ARTIFACT_KEY
+    ):
+      num_existing_events += 1
+      if event.artifact_id in artifact_ids:
+        artifact_ids_in_existing_events.add(event.artifact_id)
+
+  # Create new events only for any artifacts that don't have an existing INPUT
+  # event.
+  artifact_and_events = []
+  for i, artifact in enumerate(artifacts):
+    if artifact.id in artifact_ids_in_existing_events:
+      continue
+    event = event_lib.generate_event(
+        event_type=metadata_store_pb2.Event.INPUT,
+        key=constants.INTERMEDIATE_READ_ARTIFACT_KEY,
+        index=i + num_existing_events,
+    )
+    artifact_and_events.append((artifact, event))
+
+  # Link the intermediately read artifacts to the execution.
+  mlmd_handle.store.put_execution(
+      execution=execution,
+      artifact_and_events=artifact_and_events,
+      contexts=contexts,
+      reuse_context_if_already_exist=True,
+      reuse_artifact_if_already_exist_by_external_id=True,
+  )
