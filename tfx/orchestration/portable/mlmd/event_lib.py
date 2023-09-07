@@ -68,7 +68,10 @@ def reconstruct_artifact_id_multimap(
   result = {}
   for key in key_to_index_and_id:
     indices, artifact_ids = zip(*sorted(key_to_index_and_id[key]))
-    if tuple(indices) != tuple(range(len(indices))):
+    if (
+        len(set(indices)) != len(indices)
+        or len(indices) != max(indices) - min(indices) + 1
+    ):
       raise ValueError(
           f'Index values for key "{key}" are not consecutive. '
           'Maybe some events are missing?')
